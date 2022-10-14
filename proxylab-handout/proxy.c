@@ -10,6 +10,20 @@
 #define NTHREADS 4
 #define SBUFSIZE 16
 
+typedef struct {
+    int *buf;
+    int n;
+    int front;
+    int rear;
+
+    sem_t mutex;
+    sem_t slots;
+    sem_t items;
+} sbuf_t;
+
+sbuf_t sbuf;
+cache_t cache_blks[NUM_CACHE_BLK];
+
 struct uri_content {
     char hostname[MAXLINE];
     char path[MAXLINE];
@@ -21,6 +35,7 @@ int parse_uri(char *uri, struct uri_content *uri_data);
 void build_header(char *header, struct uri_content *uri_data, rio_t *myio);
 int connect_server(char *hostname, int port);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
+
 void sbuf_init(sbuf_t *sbuf, int n);
 void sbuf_insert(sbuf_t *sbuf, int item);
 int sbuf_remove(sbuf_t *sbuf);
@@ -48,6 +63,7 @@ int main(int argc, char *argv[])
 
     listenfd = Open_listenfd(argv[1]);
 
+    cache_init(cache_blks, NUM_CACHE_BLK);
     sbuf_init(&sbuf, SBUFSIZE);
     for(int i = 0; i < NTHREADS; i++) {
         Pthread_create(&tid, NULL, thread, NULL);
@@ -80,27 +96,44 @@ void do_request(int fd) {
         return ;
     }
 
-    struct uri_content *uri_data = (struct uri_content *)malloc(sizeof(struct uri_content));
+    int is_cached;
+    is_cached = cache_srch(cache_blks, uri, fd);
 
-    parse_uri(uri, uri_data);
-    build_header(server, uri_data, &client_rio);
+    /* 如果没在cache里，则放进cache中 */
+    if( !is_cached ) {
+        struct uri_content *uri_data = (struct uri_content *)malloc(sizeof(struct uri_content));
 
-    serverfd = Open_clientfd(uri_data->hostname, uri_data->port);
-    if(serverfd < 0) {
-        fprintf(stderr, "connect server failed\n");
-        return ;
+        parse_uri(uri, uri_data);
+        build_header(server, uri_data, &client_rio);
+
+        serverfd = Open_clientfd(uri_data->hostname, uri_data->port);
+        if(serverfd < 0) {
+            fprintf(stderr, "connect server failed\n");
+            return ;
+        }
+
+        size_t read_bytes = 0;
+        char cache_buf[MAX_OBJECT_SIZE];
+
+        Rio_readinitb(&server_rio, serverfd);
+        Rio_writen(serverfd, server, strlen(server));
+
+        int n_read;
+
+        while( (n_read = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0 ){
+            printf("Proxy receives %d bytes from server\n", n_read);
+            Rio_writen(fd, buf, n_read);
+            read_bytes += n_read;
+            if(read_bytes < MAX_OBJECT_SIZE) {
+                strcat(cache_buf, buf);
+            }
+        }
+        Close(serverfd);
+
+        if(read_bytes < MAX_OBJECT_SIZE) {
+            cache_evict(cache_blks, uri, cache_buf, read_bytes);
+        }
     }
-
-    Rio_readinitb(&server_rio, serverfd);
-    Rio_writen(serverfd, server, strlen(server));
-
-    int n_read;
-
-    while( (n_read = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0 ){
-        printf("Proxy receives %d bytes from server\n", n_read);
-        Rio_writen(fd, buf, n_read);
-    }
-    Close(serverfd);
 }
 
 int parse_uri(char *uri, struct uri_content *uri_data) {
