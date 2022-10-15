@@ -2,13 +2,15 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include "csapp.h"
-#include "cache.h"
+#include "limits.h"
 
 /* Recommended max cache and object sizes */
 #define MAX_CACHE_SIZE 1049000
 #define MAX_OBJECT_SIZE 102400
+#define MAX_CACHE 10
 #define NTHREADS 4
 #define SBUFSIZE 16
+#define NUM_CACHE_BLK 10
 
 typedef struct {
     int *buf;
@@ -22,13 +24,29 @@ typedef struct {
 } sbuf_t;
 
 sbuf_t sbuf;
-cache_t cache_blks[NUM_CACHE_BLK];
 
 struct uri_content {
     char hostname[MAXLINE];
     char path[MAXLINE];
     char port[MAXLINE];
 };
+
+typedef struct {
+    char obj[MAX_OBJECT_SIZE];
+    char uri[MAXLINE];
+    int stamp;
+    int vaild;
+
+    int readcnt;
+    sem_t w;
+    sem_t mutex;
+} block;
+
+typedef struct {
+    block data[MAX_CACHE];
+} Cache;
+
+Cache cache;
 
 void do_request(int fd);
 int parse_uri(char *uri, struct uri_content *uri_data);
@@ -40,6 +58,12 @@ void sbuf_init(sbuf_t *sbuf, int n);
 void sbuf_insert(sbuf_t *sbuf, int item);
 int sbuf_remove(sbuf_t *sbuf);
 void *thread(void *vargp);
+
+void cache_init();
+int cache_srch(char *uri);
+int cache_index();
+void cache_update(int index);
+void cache_write(char *uri, char *buf);
 
 /* You won't lose style points for including this long line in your code */
 static const char *connection_header = "Connection: close\r\n";
@@ -63,7 +87,7 @@ int main(int argc, char *argv[])
 
     listenfd = Open_listenfd(argv[1]);
 
-    cache_init(cache_blks, NUM_CACHE_BLK);
+    cache_init();
     sbuf_init(&sbuf, SBUFSIZE);
     for(int i = 0; i < NTHREADS; i++) {
         Pthread_create(&tid, NULL, thread, NULL);
@@ -82,6 +106,7 @@ int main(int argc, char *argv[])
 void do_request(int fd) {
     char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
     char server[MAXLINE];
+    char cache_tag[MAXLINE];
 
     int serverfd;
 
@@ -91,48 +116,61 @@ void do_request(int fd) {
     Rio_readlineb(&client_rio, buf, MAXLINE);
     sscanf(buf, "%s %s %s", method, uri, version);
 
+    strcpy(cache_tag, uri);
+
     if( strcasecmp(method, "GET") ) {
         clienterror(fd, method, "501", "Not implemented", "Tiny does not implement this method");
         return ;
     }
 
-    int is_cached;
-    is_cached = cache_srch(cache_blks, uri, fd);
+    struct uri_content *uri_data = (struct uri_content *)malloc(sizeof(struct uri_content));
 
-    /* 如果没在cache里，则放进cache中 */
-    if( !is_cached ) {
-        struct uri_content *uri_data = (struct uri_content *)malloc(sizeof(struct uri_content));
+    int idx;
+    idx = cache_srch(cache_tag);
 
-        parse_uri(uri, uri_data);
-        build_header(server, uri_data, &client_rio);
+    if( idx != -1) {
+         P(&cache.data[idx].mutex);
+         cache.data[idx].readcnt++;
+         if( cache.data[idx].readcnt == 1 ) {
+             P(&cache.data[idx].w);
+         }
+         V(&cache.data[idx].mutex);
+         
+         Rio_writen(fd, cache.data[idx].obj, strlen(cache.data[idx].obj));
 
-        serverfd = Open_clientfd(uri_data->hostname, uri_data->port);
-        if(serverfd < 0) {
-            fprintf(stderr, "connect server failed\n");
-            return ;
+        P(&cache.data[idx].mutex);
+        cache.data[idx].readcnt--;
+        if( cache.data[idx].readcnt == 0 ) {
+            V(&cache.data[idx].w);
         }
+        V(&cache.data[idx].mutex);
+        return ;
+    }
 
-        size_t read_bytes = 0;
-        char cache_buf[MAX_OBJECT_SIZE];
-
-        Rio_readinitb(&server_rio, serverfd);
-        Rio_writen(serverfd, server, strlen(server));
-
-        int n_read;
-
-        while( (n_read = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0 ){
-            printf("Proxy receives %d bytes from server\n", n_read);
-            Rio_writen(fd, buf, n_read);
-            read_bytes += n_read;
-            if(read_bytes < MAX_OBJECT_SIZE) {
-                strcat(cache_buf, buf);
-            }
-        }
-        Close(serverfd);
-
+    parse_uri(uri, uri_data);
+    build_header(server, uri_data, &client_rio);
+    serverfd = Open_clientfd(uri_data->hostname, uri_data->port);
+    if(serverfd < 0) {
+        fprintf(stderr, "connect server failed\n");
+        return ;
+    }
+    size_t read_bytes = 0;
+    char cache_buf[MAX_OBJECT_SIZE];
+    Rio_readinitb(&server_rio, serverfd);
+    Rio_writen(serverfd, server, strlen(server));
+    int n_read;
+    while( (n_read = Rio_readlineb(&server_rio, buf, MAXLINE)) != 0 ){
+        printf("Proxy receives %d bytes from server\n", n_read);
+        Rio_writen(fd, buf, n_read);
+        read_bytes += n_read;
         if(read_bytes < MAX_OBJECT_SIZE) {
-            cache_evict(cache_blks, uri, cache_buf, read_bytes);
+            strcat(cache_buf, buf);
         }
+    }
+    Close(serverfd);
+
+    if(read_bytes < MAX_OBJECT_SIZE) {
+        cache_write(cache_tag, cache_buf);
     }
 }
 
@@ -259,4 +297,109 @@ void *thread(void *vargp) {
         do_request(connfd);
         Close(connfd);
     }
+}
+
+void cache_init() {
+    for(int i = 0; i < MAX_CACHE; i++) {
+        cache.data[i].stamp = 0;
+        cache.data[i].vaild = 0;
+        cache.data[i].readcnt = 0;
+        Sem_init(&cache.data[i].w, 0, 1);
+        Sem_init(&cache.data[i].mutex, 0, 1);
+    }
+}
+
+int cache_srch(char *uri) {
+    int i;
+    for(i = 0; i < MAX_CACHE; i++) {
+        P(&cache.data[i].mutex);
+        cache.data[i].readcnt++;
+        if( cache.data[i].readcnt == 1 ) {
+            P(&cache.data[i].w);
+        }
+        V(&cache.data[i].mutex);
+
+        if( cache.data[i].vaild && !strcmp(cache.data[i].uri, uri) ) {
+            break;
+        }
+
+        P(&cache.data[i].mutex);
+        cache.data[i].readcnt--;
+        if( cache.data[i].readcnt == 0 ) {
+            V(&cache.data[i].w);
+        }
+        V(&cache.data[i].mutex);
+    }
+    if( i >= MAX_CACHE ) {
+        return -1;
+    }
+    return i;
+}
+
+int cache_index() {
+    int min = INT_MAX;
+    int idx = 0;
+    for(int i = 0; i < MAX_CACHE; i++) {
+        P(&cache.data[i].mutex);
+        cache.data[i].readcnt++;
+        if( cache.data[i].readcnt == 1 ) {
+            P(&cache.data[i].w);
+        }
+        V(&cache.data[i].mutex);
+
+        if( !cache.data[i].vaild ) {
+            idx = i;
+            P(&cache.data[i].mutex);
+            cache.data[i].readcnt--;
+            if( cache.data[i].readcnt == 0 ) {
+                V(&cache.data[i].w);
+            }
+            V(&cache.data[i].mutex);
+            break;
+        }
+
+        if( cache.data[i].stamp < min ) {
+            idx = i;
+            P(&cache.data[i].mutex);
+            cache.data[i].readcnt--;
+            if( cache.data[i].readcnt == 0 ) {
+                V(&cache.data[i].w);
+            }
+            V(&cache.data[i].mutex);
+            continue;
+        }
+
+        P(&cache.data[i].mutex);
+        cache.data[i].readcnt--;
+        if( cache.data[i].readcnt == 0 ) {
+            V(&cache.data[i].w);
+        }
+        V(&cache.data[i].mutex);
+    }
+
+    return idx;
+}
+
+void cache_update(int index) {
+    for(int i = 0; i < MAX_CACHE; i++) {
+        if( cache.data[i].vaild && i != index) {
+            P(&cache.data[i].w);
+            cache.data[i].stamp--;
+            V(&cache.data[i].w);
+        }
+    }
+}
+
+void cache_write(char *uri, char *buf) {
+    int i = cache_index();
+
+    P(&cache.data[i].w);
+
+    strcpy(cache.data[i].obj, buf);
+    strcpy(cache.data[i].uri, uri);
+    cache.data[i].vaild = 1;
+    cache.data[i].stamp = INT_MAX;
+    cache_update(i);
+
+    V(&cache.data[i].w);
 }

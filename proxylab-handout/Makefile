@@ -5,7 +5,7 @@
 # build your proxy from sources.
 
 CC = gcc
-CFLAGS = -g -Wall
+CFLAGS = -g -Wall 
 LDFLAGS = -lpthread
 
 all: proxy
@@ -13,14 +13,11 @@ all: proxy
 csapp.o: csapp.c csapp.h
 	$(CC) $(CFLAGS) -c csapp.c
 
-cache.o: cache.c cache.h
-	$(CC) $(CFLAGS) -c cache.c
-
-proxy.o: proxy.c csapp.h cache.h
+proxy.o: proxy.c csapp.h
 	$(CC) $(CFLAGS) -c proxy.c
 
-proxy: proxy.o csapp.o cache.o
-	$(CC) $(CFLAGS) proxy.o csapp.o cache.o -o proxy $(LDFLAGS)
+proxy: proxy.o csapp.o
+	$(CC) $(CFLAGS) proxy.o csapp.o -o proxy $(LDFLAGS)
 
 # Creates a tarball in ../proxylab-handin.tar that you can then
 # hand in. DO NOT MODIFY THIS!
